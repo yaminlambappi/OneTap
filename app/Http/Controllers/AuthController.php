@@ -2,15 +2,21 @@
 
 namespace App\Http\Controllers;
 
-use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Facades\Auth;
 use App\Models\User;
-
+use App\Models\Campus;
+use App\Models\UserStreak;
+use App\Models\SocialScore;
+use App\Models\UserPresence;
+use App\Services\AnonymousIdentityService;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Hash;
 
 class AuthController extends Controller
 {
-    public function showLoginForm()
+    public function __construct(private AnonymousIdentityService $identity) {}
+
+    public function showLogin()
     {
         return view('auth.login');
     }
@@ -18,44 +24,78 @@ class AuthController extends Controller
     public function login(Request $request)
     {
         $request->validate([
-            'username' => 'required|string|min:3|max:255',
-            'password' => 'required|string|min:6',
+            'username' => 'required|string',
+            'password' => 'required|string',
         ]);
-        if (Auth::attempt(['username' => $request->username, 'password' => $request->password])) {
-            return redirect()->route('home.index')->with('success', 'Welcome back! 📸 ');
+
+        if (Auth::attempt(['username' => $request->username, 'password' => $request->password], $request->boolean('remember'))) {
+            $request->session()->regenerate();
+            $user = Auth::user();
+            $user->update(['last_active_at' => now()]);
+
+            UserPresence::updateOrCreate(
+                ['user_id' => $user->id],
+                ['is_online' => true, 'status' => 'online', 'last_seen_at' => now()]
+            );
+
+            return redirect()->intended(route('feed.index'));
         }
-        return view('auth.login');
-    }
-    public function logout()
-    {
-        Auth::logout();
-        return redirect()->route('home.index');
+
+        return back()->withErrors(['username' => 'Invalid credentials.'])->withInput();
     }
 
-    public function showRegistrationForm()
+    public function showRegister()
     {
-        return view('auth.register');
+        $campuses = Campus::where('is_active', true)->orderBy('name')->get();
+        return view('auth.register', compact('campuses'));
     }
 
     public function register(Request $request)
     {
         $request->validate([
-            'username' => 'required|string|min:3|max:255|unique:users,username',
-            'phone' => 'required|digits_between:8,15|unique:users,phone',
-            'password' => 'required|string|min:6|confirmed', 
+            'username'  => 'required|string|min:3|max:30|unique:users,username|regex:/^[a-zA-Z0-9_]+$/',
+            'phone'     => 'required|digits_between:10,15|unique:users,phone',
+            'campus_id' => 'nullable|exists:campuses,id',
+            'password'  => 'required|string|min:8|confirmed',
         ]);
 
         $user = User::create([
-            'username' => $request->username,
-            'phone' => $request->phone,
-            'password' => Hash::make($request->password),
-            'streak' => 0,
+            'username'              => $request->username,
+            'phone'                 => $request->phone,
+            'campus_id'             => $request->campus_id,
+            'password'              => Hash::make($request->password),
+            'anonymous_alias'       => $this->identity->generateAlias(0, uniqid()),
+            'anonymous_avatar_seed' => $this->identity->generateAvatarSeed(0, uniqid()),
         ]);
 
-        Auth::login($user);
+        // Bootstrap gamification records
+        UserStreak::create(['user_id' => $user->id]);
+        SocialScore::create(['user_id' => $user->id, 'badges' => ['early_adopter']]);
+        UserPresence::create(['user_id' => $user->id, 'is_online' => true, 'status' => 'online']);
 
-        return redirect()->route('home.index')->with('success', 'Welcome to OneTap! 📸');
+        // Update campus member count
+        if ($user->campus_id) {
+            Campus::where('id', $user->campus_id)->increment('member_count');
+        }
+
+        Auth::login($user);
+        $request->session()->regenerate();
+
+        return redirect()->route('feed.index')->with('welcome', true);
     }
 
+    public function logout(Request $request)
+    {
+        $user = Auth::user();
+        if ($user) {
+            UserPresence::where('user_id', $user->id)
+                ->update(['is_online' => false, 'status' => 'offline', 'last_seen_at' => now()]);
+        }
 
+        Auth::logout();
+        $request->session()->invalidate();
+        $request->session()->regenerateToken();
+
+        return redirect()->route('home');
+    }
 }
